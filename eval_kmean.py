@@ -37,6 +37,8 @@ from torchvision import datasets
 from torchvision import transforms as pth_transforms
 from torchvision import models as torchvision_models
 
+from vision_transformer import DINOHead
+
 import utils
 import vision_transformer as vits
 
@@ -44,7 +46,6 @@ from sklearn.cluster import MiniBatchKMeans
 import numpy as np
 from termcolor import colored
 from scipy.optimize import linear_sum_assignment
-
 
 def extract_feature_pipeline(args):
     # ============ preparing data ... ============
@@ -75,20 +76,30 @@ def extract_feature_pipeline(args):
     print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
 
     # ============ building network ... ============
-    if "vit" in args.arch:
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
-        print(f"Model {args.arch} {args.patch_size}x{args.patch_size} built.")
-    elif "xcit" in args.arch:
-        model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
-    elif args.arch in torchvision_models.__dict__.keys():
-        model = torchvision_models.__dict__[args.arch](num_classes=0)
-        model.fc = nn.Identity()
+    if args.use_dino_head:
+        # model will be backbone + dino head
+        assert args.pretrained_weights!= None, "Please specify the path to the pretrained weights for the full model(including dino head)"
+        backbone = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+        head = DINOHead(embed_dim =backbone.embed_dim, out_dim=65536, ause_bn=False)
+        model = nn.Sequential(backbone, head)
+        # TODO still in construction
+        raise NotImplementedError
     else:
-        print(f"Architecture {args.arch} non supported")
-        sys.exit(1)
-    model.cuda()
-    utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
-    model.eval()
+        # only backbone
+        if "vit" in args.arch:
+            model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+            print(f"Model {args.arch} {args.patch_size}x{args.patch_size} built.")
+        elif "xcit" in args.arch:
+            model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
+        elif args.arch in torchvision_models.__dict__.keys():
+            model = torchvision_models.__dict__[args.arch](num_classes=0)
+            model.fc = nn.Identity()
+        else:
+            print(f"Architecture {args.arch} non supported")
+            sys.exit(1)
+        model.cuda()
+        utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
+        model.eval()
 
     # ============ extract features ... ============
     print("Extracting features for train set...")
@@ -187,7 +198,8 @@ def run_kmeans(x, nmb_clusters, max_points, val_features=None, use_faiss=True,
                              batch_size = 1000)
         kmeans.fit(x)
         preds = kmeans.predict(val_features)
-        centroids = None
+        centroids = kmeans.cluster_centers_
+     
 
     return preds, centroids
 
@@ -249,6 +261,12 @@ def kmeans(features, features_val, labels_val, nmb_clusters, target_nub_clusters
     features_val = features_val.cpu().numpy()
     labels_val = labels_val.cpu().numpy()
 
+    print(features.shape, "features shape")
+    print(features_val.shape, "val features shape")
+    print(labels_val.shape, "val labels shape")
+    print(labels_val.max(),labels_val.min() )
+  
+
     # l2-normalize whitened features
     if whiten_feats:
         features = vq.whiten(features)
@@ -264,6 +282,7 @@ def kmeans(features, features_val, labels_val, nmb_clusters, target_nub_clusters
 
         # run kmeans
         num_elems = labels_val.shape[0]
+        print(use_faiss, "use faiss")
         I, centroids = run_kmeans(features, nmb_clusters=nmb_clusters, 
                 max_points=int(features.shape[0]/nmb_clusters), 
                 val_features=features_val, 
@@ -271,7 +290,8 @@ def kmeans(features, features_val, labels_val, nmb_clusters, target_nub_clusters
         pred_labels = np.array(I)
 
         print(centroids.shape, "centroids shape")
-        print(I.shape, "predicted shape", I[0],"first element of prediction")
+        print(I.shape, ":predicted shape,", I[0],":first element of prediction")
+        print(f"the first label of pred_labels should be {labels_val[0]}")
 
         if nmb_clusters == target_nub_clusters:
             # number of clusters equals number of classes C in dataset
@@ -286,10 +306,14 @@ def kmeans(features, features_val, labels_val, nmb_clusters, target_nub_clusters
             match = _majority_match(pred_labels, labels_val)
 
         reordered_preds = np.zeros(num_elems)
+        reordered_centroids = np.zeros_like(centroids)
+
         for pred_i, target_i in match:
             reordered_preds[pred_labels == int(pred_i)] = int(target_i)
+            reordered_centroids[int(target_i)] = centroids[int(pred_i)]
+            
 
-        # gather performance metrics
+        # gather performance metrics)
         acc = int((reordered_preds == labels_val).sum()) / float(num_elems)
         if return_all_metrics:
             nmi_lst.append(metrics.normalized_mutual_info_score(labels_val, pred_labels))
@@ -301,54 +325,9 @@ def kmeans(features, features_val, labels_val, nmb_clusters, target_nub_clusters
     # return performance metrics
     if return_all_metrics:
         return {'ACC': 100*np.mean(acc_lst), 'NMI': 100*np.mean(nmi_lst), 
-                'ARI': 100*np.mean(ari_lst)}, reordered_preds
+                'ARI': 100*np.mean(ari_lst)}, reordered_preds, reordered_centroids
     else:
-        return {'ACC': 100*np.mean(acc_lst)}, reordered_preds
-
-############################### old code #####################################
-# @torch.no_grad()
-# def knn_classifier(train_features, train_labels, test_features, test_labels, k, T, num_classes=1000):
-#     top1, top5, total = 0.0, 0.0, 0
-#     train_features = train_features.t()
-#     num_test_images, num_chunks = test_labels.shape[0], 100
-#     imgs_per_chunk = num_test_images // num_chunks
-#     retrieval_one_hot = torch.zeros(k, num_classes).to(train_features.device)
-#     for idx in range(0, num_test_images, imgs_per_chunk):
-#         # get the features for test images
-#         features = test_features[
-#             idx : min((idx + imgs_per_chunk), num_test_images), :
-#         ]
-#         targets = test_labels[idx : min((idx + imgs_per_chunk), num_test_images)]
-#         batch_size = targets.shape[0]
-
-#         # calculate the dot product and compute top-k neighbors
-#         similarity = torch.mm(features, train_features)
-#         distances, indices = similarity.topk(k, largest=True, sorted=True)
-#         candidates = train_labels.view(1, -1).expand(batch_size, -1)
-#         retrieved_neighbors = torch.gather(candidates, 1, indices)
-
-#         retrieval_one_hot.resize_(batch_size * k, num_classes).zero_()
-#         retrieval_one_hot.scatter_(1, retrieved_neighbors.view(-1, 1), 1)
-#         distances_transform = distances.clone().div_(T).exp_()
-#         probs = torch.sum(
-#             torch.mul(
-#                 retrieval_one_hot.view(batch_size, -1, num_classes),
-#                 distances_transform.view(batch_size, -1, 1),
-#             ),
-#             1,
-#         )
-#         _, predictions = probs.sort(1, True)
-
-#         # find the predictions that match the target
-#         correct = predictions.eq(targets.data.view(-1, 1))
-#         top1 = top1 + correct.narrow(1, 0, 1).sum().item()
-#         top5 = top5 + correct.narrow(1, 0, min(5, k)).sum().item()  # top5 does not make sense if k < 5
-#         total += targets.size(0)
-#     top1 = top1 * 100.0 / total
-#     top5 = top5 * 100.0 / total
-#     return top1, top5
-#############################################################################
-
+        return {'ACC': 100*np.mean(acc_lst)}, reordered_preds, reordered_centroids
 
 class ReturnIndexDataset(datasets.ImageFolder):
     def __getitem__(self, idx):
@@ -361,6 +340,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size_per_gpu', default=256, type=int, help='Per-GPU batch-size')
     parser.add_argument('--temperature', default=0.07, type=float,
         help='Temperature used in the voting coefficient')
+    parser.add_argument('--use_dino_head', default=False, type=utils.bool_flag)
     parser.add_argument('--pretrained_weights', default='', type=str, help="Path to pretrained weights to evaluate.")
     parser.add_argument('--use_cuda', default=True, type=utils.bool_flag,
         help="Should we store the features on GPU? We recommend setting this to False if you encounter OOM")
@@ -370,16 +350,16 @@ if __name__ == '__main__':
         help='Key to use in the checkpoint (example: "teacher")')
     parser.add_argument('--dump_features', default="Results/", 
         help='Path where to save computed features, empty for no saving')
-    parser.add_argument('--load_features', default=None, help="""If the features have
+    parser.add_argument('--load_features', default="Results/", help="""If the features have
         already been computed, where to find them.""")
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
-    parser.add_argument('--data_path', default='/home/xiaoyan/Documents/Data/ImageNet', type=str)
+    parser.add_argument('--data_path', default='/home/xiaoyan/Documents/Data/miniimagenet_yu/', type=str)
 
     # k-means params
-    parser.add_argument("--num_classes", type=int, default=1000, help='dataset classes')
+    parser.add_argument("--num_classes", type=int, default=64, help='dataset classes')
     parser.add_argument("--overcluster", type=int, default=1)
     args = parser.parse_args()
 
@@ -406,15 +386,12 @@ if __name__ == '__main__':
         
         print("Features are ready!\nStart the k-NN classification.")
 
-        # cluster train
-        res, reordered_preds = kmeans(train_features, train_features, train_labels,
+        # cluster train features
+        res, reordered_preds, reordered_centroids = kmeans(train_features, train_features, train_labels,
             nmb_clusters=args.num_classes*args.overcluster, target_nub_clusters= args.num_classes, use_faiss=False, num_trials=1, 
             whiten_feats=True, return_all_metrics=True, seed=1234)
-        ############################### old code #####################################
-        # print("Features are ready!\nStart the k-NN classification.")
-        # for k in args.nb_knn:
-        #     top1, top5 = knn_classifier(train_features, train_labels,
-        #         test_features, test_labels, k, args.temperature)
-        #     print(f"{k}-NN classifier result: Top1: {top1}, Top5: {top5}")
-        #############################################################################
+    
+        # save centroids
+        if args.dump_features and dist.get_rank() == 0:
+            torch.save(train_features.cpu(), os.path.join(args.dump_features, "train_centroids.pth"))
     dist.barrier()
