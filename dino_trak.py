@@ -23,7 +23,7 @@ import numpy as np
 from termcolor import colored
 from scipy.optimize import linear_sum_assignment
 
-from trak import TRAKer
+from patchtrak import TRAKer
 
 
 
@@ -77,25 +77,33 @@ if __name__ == '__main__':
 ## load the centroid features
 
 # # load the image and pick the the target class centroid
-image = img
-target_class = 0
+image_path ="/home/xiaoyan/Documents/Data//home/xiaoyan/Documents/Data/miniimagenet_yu/train/n02101006/n02101006_354.JPEG"
+target_class = 10
+image1 = img
+image2 = image1
+# calulate the patch number
 
-centroid_feats = torch.load(os.path.join(args.entroids_folder, "traincentroids.pth"))
-centroid_feat = centroid_feats[target_class,:]
+
+patch_num2 = patch_num1
+target_class = 0
+split = 'train'
+
+centroid_feats = torch.load(os.path.join(args.centroids_folder, f"{split}_centroid.pth"))
+centroid_feat = centroid_feats[target_class]
 # initialize TRAKer
 # put the load centroid features and a pair of images
     
 
 
-
-
-traker = TRAKer(model=model,
-                task='image_classification',
-                train_set_size=len(loader_train.dataset))
-
 traker = TRAKer(model = model,
                 task = args.task,
-                image = image,
+                patch_num = patch_num1,
                 centroid = centroid_feat)
+traker.featurize(image= image1)
+traker.finalize_featurize()
 
-traker = TRAKer(..., proj_dim=4096)  # default dimension is 2048
+# need to reset everything and and zero gradients
+traker.start_scoring_checkpoint(checkpoint,
+                                patch_num=patch_num2)
+traker.score(image=image2)
+scores=traker.finalize_score()
