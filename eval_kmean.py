@@ -368,6 +368,9 @@ if __name__ == '__main__':
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
+    if args.dump_features:
+        args.dump_features = os.path.join(args.dump_features, f"{args.arch}{args.patch_size}_s{args.patch_size}") # stride = patch size TODO
+
     if args.load_features:
         train_features = torch.load(os.path.join(args.load_features, "trainfeat.pth"))
         test_features = torch.load(os.path.join(args.load_features, "testfeat.pth"))

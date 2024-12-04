@@ -21,8 +21,13 @@ from .utils import get_num_params, parameters_to_vector
 from .modelout_functions import AbstractModelOutput
 import logging
 import torch
-
+from typing import Union, List, Tuple
+from PIL import Image
+from torchvision import transforms as pth_transforms
+from pathlib import Path
 ch = torch
+import re, sys
+import torch.nn.functional as F
 
 
 class AbstractGradientComputer(ABC):
@@ -72,6 +77,7 @@ class AbstractGradientComputer(ABC):
         self.dtype = dtype
         self.device = device
 
+
     @abstractmethod
     def load_model_params(self, model) -> None:
         ...
@@ -83,6 +89,344 @@ class AbstractGradientComputer(ABC):
     @abstractmethod
     def compute_loss_grad(self, batch: Iterable[Tensor], batch_size: int) -> Tensor:
         ...
+
+class PatchGradientComputer(AbstractGradientComputer):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        patch_size: int,
+        stride: Tuple[int, int],
+        task: AbstractModelOutput,
+        centroids: torch.Tensor,
+        grad_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        grad_wrt: Optional[Iterable[str]] = None, # grad_wrt contains the layer_idx information, e.g, wkey_11
+        facet: Optional[Iterable[str]] = None, # ["wkey"]
+        include_cls: bool = False,
+    ) -> None:
+        super().__init__(model, task, grad_dim, dtype, device)
+        self.model = model
+        self.patch_size = patch_size
+        self.stride = stride
+        # self.load_model_params(model) # TODO check if we need this 
+        self.grad_wrt = grad_wrt
+        # get layer info from grad_wrt
+        assert len(self.grad_wrt)==1, "grad_wrt should be a list of length 1" # TODO check if we need this
+        self.layers = []
+        for string in self.grad_wrt:
+            numbers = list(filter(lambda x: x.isdigit(), string.split(".")))
+            self.layers += [int(s) for s in numbers]
+        print("layers", self.layers)
+        self.facet = facet
+        self.include_cls = include_cls
+        self.centroids = centroids.to(self.device)
+ 
+
+        self.logger = logging.getLogger("GradientComputer")
+
+       
+ 
+        self.hook_handlers = [] #TODO check if we need this
+        # self.total_num_patches = 0 #TODO check if we need this
+
+        # register hook for the model
+        assert len(self.layers)==1 and len(self.facet)==1, "currently only support one layer one facet."
+        self._register_hooks(self.layers, self.facet[0]) #self.layers should be a list, self.facet[0] must be a string
+
+
+    def finish_grads_computation(self):
+        self._unregister_hooks()
+    
+    def load_model_params(self, model) -> None:
+        '''
+        we may not need this function
+        '''
+        self.model = model
+        return None
+
+ 
+    def compute_per_sample_grad(self, batch: Iterable[Tensor]) -> Tensor:
+        self.total_num_patches = 0
+        batch_grads=[]
+        imgs, labels = batch
+        imgs, labels = imgs.to(self.device), labels.to(self.device)
+
+        for sample, label in zip(imgs, labels):
+            sample, label = sample.unsqueeze(0), label.unsqueeze(0)
+            sample_grad = self.compute_per_patch_grad(sample, label)
+            if sample_grad.shape[0]==1:
+                sample_grad = sample_grad.squeeze(0)
+
+            if not self.include_cls:
+                batch_grads.append(sample_grad[1:,:])
+        grads = torch.cat(batch_grads,dim=0)
+        return grads
+
+
+    def compute_loss_grad(self, batch: Iterable[Tensor], batch_size: int) -> Tensor:
+        return None
+    
+    def compute_per_patch_grad(self, sample: Tensor, label: Tensor) -> Tensor:
+
+        # TODO check how to use toch.func.grad and torch.func.vmap
+        self._extract_features(sample, self.centroids[label].unsqueeze(0), self.facet[0])
+        return self._feats[0]
+
+
+
+    def _extract_features(self, image: Tensor, centroid_feat: Tensor,  facet: str = 'key') -> List[torch.Tensor]:
+        """
+        extract features from the model
+        :param batch: batch to extract features for. Has shape BxCxHxW.
+        :param layers: layer to extract. A number between 0 to 11.
+        :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token' | 'attn']
+        :return : tensor of features.
+                  if facet is 'key' | 'query' | 'value' has shape Bxhxtxd
+                  if facet is 'attn' has shape Bxhxtxt
+                  if facet is 'token' has shape Bxtxd
+        """
+        B, C, H, W = image.shape
+        self._feats = []
+        self.setting_dict = {}
+        self._v = []
+        self._attn = []
+        self._input = []
+        self._k = []
+        self._q =[]
+        
+        num_patches = (1 + (H - self.patch_size) // self.stride[0], 1 + (W - self.patch_size) // self.stride[1])
+        self.total_num_patches += num_patches[0] * num_patches[1]
+
+
+        if facet[0]== 'w':
+            # batch.requires_grad = True # turn on the requires_grad for the batch
+            # self.model.train()
+               
+            logits = self.model(image) # [1, feature_dim]
+            loss = self.dino_loss(logits, centroid_feat)
+         
+            self.model.zero_grad()
+            loss.backward(retain_graph=True)
+
+            self._weight_feats_calc(facet, self._grad)
+            # print(f"get {facet} features with its dimension {self._feats[0].shape}")
+        else:
+            _ = self.model(image)
+            # print(f"get {facet} features with its dimension {self._feats[0].shape}") #  B x num_heads x N x C // num_heads
+
+
+        
+        assert self._feats!=[], "no features are extracted"
+        return self._feats
+
+
+    def dino_loss(self, logits, centroid_feat):
+        student_out = logits
+        teacher_out = F.softmax((centroid_feat) , dim=-1)
+        loss = torch.sum(-teacher_out * F.log_softmax(student_out, dim=-1), dim=-1)
+        return loss
+    
+
+    def _register_hooks(self, layers: List[int], facet: str) -> None:
+        """
+        register hook to extract features.
+        :param layers: layers from which to extract features.
+        :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token' | 'attn']
+        """
+        for block_idx, block in enumerate(self.model.blocks):
+            if block_idx in layers:
+                if facet == 'token':
+                    self.hook_handlers.append(block.register_forward_hook(self._get_hook(facet)))
+                elif facet == 'attn':
+                    self.hook_handlers.append(block.attn.attn_drop.register_forward_hook(self._get_hook(facet)))
+                elif facet in ['key', 'query', 'value']:
+                    self.hook_handlers.append(block.attn.register_forward_hook(self._get_hook(facet)))
+                elif facet in ['wkey', 'wquery', 'wvalue']:
+                    self.hook_handlers.append(block.attn.register_forward_hook(self._get_weight_hook(facet, 'forward')))
+                    self.hook_handlers.append(block.attn.proj.register_backward_hook(self._get_weight_hook(facet, 'backward')))
+                elif facet == 'wfc1':
+                    self.hook_handlers.append(block.mlp.fc1.register_forward_hook(self._get_weight_hook(facet, 'forward')))
+                    self.hook_handlers.append(block.mlp.fc1.register_backward_hook(self._get_weight_hook(facet, 'backward')))
+                elif facet == 'wfc2':
+                    self.hook_handlers.append(block.mlp.fc2.register_forward_hook(self._get_weight_hook(facet, 'forward')))
+                    self.hook_handlers.append(block.mlp.fc2.register_backward_hook(self._get_weight_hook(facet, 'backward')))
+                else:
+                    raise TypeError(f"{facet} is not a supported facet.")
+
+
+    def _get_weight_hook(self, facet: str, path: str):
+        """
+        generate a hook method for the weights in a specific block and facet.
+        """
+        print("register weight hook for the model----------------")
+        if path == 'forward':
+            '''
+            foward hook to get the setting_dict and other necessary values
+            '''
+            if facet in ['wfc1', 'wfc2']:
+                def _inner_hook(module, input, output):
+                    self._input.append(input[0])
+                return _inner_hook
+
+            else:
+                def _inner_hook(module, input, output):
+                    input = input[0]
+                    B, N, C = input.shape
+                    qkv = module.qkv(input).reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
+
+                    q, k, v = qkv[0], qkv[1], qkv[2]
+                    attn = (q @ k.transpose(-2, -1)) #* module.scale
+                    # print(attn.shape, "attn.shape")  # shape should be B, nh, N, N
+
+                    self.setting_dict ={
+                        'B': B,
+                        'N': N,
+                        'C': C,
+                        'num_heads': module.num_heads,
+                        'scale': module.scale
+                    }
+                    if facet == 'wattn':
+                        self._v.append(v)
+                    
+                    elif facet == 'wvalue':
+                        self._attn.append(attn)
+                        self._input.append(input)
+                    elif facet == 'wkey':
+                        self._attn.append(attn)
+                        self._v.append(v)
+                        self._input.append(input)
+                        self._q = q  # B, num_heads, N, C // num_heads
+                    elif facet == 'wquery':
+                        self._attn.append(attn)
+                        self._v.append(v)
+                        self._input.append(input)
+                        self._k = k # B, num_heads, N, C // num_heads
+                    else:
+                        raise TypeError(f"{facet} is not a supported facet.")
+                return _inner_hook
+            
+        elif path == 'backward':
+            if facet in ['wfc1', 'wfc2']:
+                def _inner_hook(module, grad_input, grad_output):
+
+                    self._grad = grad_input[0].unsqueeze(0) # N, C -> 1, N, C
+                    
+
+            else:
+                def _inner_hook(module, grad_input, grad_output):
+                    '''
+                    first step: get the graddents of the output with respect to the attention layer
+                    '''
+                    # https://discuss.pytorch.org/t/what-does-gard-input-and-grad-output-mean/195577
+                    # shows that we need grad_input
+
+                    # grad_input[0] shape B, N, C
+                    # TODO assign value B, num_heads, N, N
+                    grad = grad_input[0].reshape(self.setting_dict["B"],  self.setting_dict["N"], self.setting_dict["num_heads"],
+                                                self.setting_dict["C"]// self.setting_dict["num_heads"]) # B, N, C-> B, N, num_heads, C // num_heads
+                    grad = grad.permute(0,2,1,3) # B, num_heads, N, C // num_heads
+                
+                    self._grad = grad
+            
+
+            return _inner_hook
+        else:
+            raise TypeError(f"{path} is not a supported path.")
+
+    def _weight_feats_calc(self, facet: str, grad: torch.Tensor) :
+        if facet == 'wattn': 
+            grad = grad @ self._v[0].transpose(-2, -1) # B, num_heads, N, C // num_heads @ B, num_heads, C // num_heads, N -> B, num_heads, N, N
+            grad_features =  grad.mean(dim=1) # B, N, N as we average over the heads
+
+            print("calculate the gradients on the value matrix")
+        elif facet == 'wvalue':
+            attn = (self._attn[0]* self.setting_dict["scale"]).softmax(dim=-1)
+            # TODO check if we need dropout func here
+
+            # gradients on the value matrix
+            grad = attn.transpose(-2, -1) @ grad # B, num_heads, N, N @ B, num_heads, N, C // num_heads -> B, num_heads, N, C // num_heads
+            grad = grad.transpose(1,2) # B, N, num_heads, C // num_heads
+            grad = grad.reshape(self.setting_dict["B"],self.setting_dict["N"], self.setting_dict["C"]) # B, N, C
+
+            # gradients on the value weight
+            grad_features = torch.zeros(self.setting_dict["B"], self.setting_dict["N"], self.setting_dict["C"], self.setting_dict["C"]).to(self.device)
+            for i in range(self.setting_dict["N"]):
+                # B, C, 1 @ B, 1, C -> B, C, C-> iterate to B, N, C, C 
+                grad_features[:,i,:,:] = self._input[0][:,i, :].unsqueeze(-2).transpose(-2,-1)@grad[:,i,:].unsqueeze(-2) 
+            grad_features = grad_features.reshape(self.setting_dict["B"], self.setting_dict["N"], self.setting_dict["C"]* self.setting_dict["C"])
+        elif facet == 'wkey':
+            # gradients on the attn
+            grad = grad @ self._v[0].transpose(-2, -1) # B, num_heads, N, C // num_heads @ B, num_heads, C // num_heads, N -> B, num_heads, N, N
+            # dropout layer scient pass and then softmax layer
+            attn_output = torch.nn.Softmax(dim=-1)(self._attn[0])
+            grad = torch.autograd.grad(attn_output, self._attn[0], grad, retain_graph=True)[0] # chek retain_graph; size B, num_heads, N, N
+            grad = grad*self.setting_dict["scale"]
+        
+            # print(torch.unique(grad[:,:,1:,1:]), "grad[:,:,1:,1:] for wkey in the previous step")
+            # gradients on the key matrix
+            grad = self._q[0].transpose(-2,-1)@grad # B, num_heads, C // num_heads, N @ B, num_heads, N, N -> B, num_heads,  C // num_heads, N
+            grad = grad.permute(0,3,1,2) # B, N, num_heads, C // num_heads
+            # gradient on the key weight, before summing together on each of patches
+            grad = grad.reshape(self.setting_dict["B"],self.setting_dict["N"], self.setting_dict["C"]) # B, N, C
+
+            grad_features = torch.zeros(self.setting_dict["B"], self.setting_dict["N"], self.setting_dict["C"], self.setting_dict["C"]).to(self.device)
+            for i in range(self.setting_dict["N"]):
+                # B, C, 1 @ B, 1, C -> B, C, C-> iterate to B, N, C, C 
+                grad_features[:,i,:,:] = self._input[0][:,i, :].unsqueeze(-2).transpose(-2,-1)@grad[:,i,:].unsqueeze(-2) 
+            grad_features = grad_features.reshape(self.setting_dict["B"], self.setting_dict["N"], self.setting_dict["C"]* self.setting_dict["C"])
+
+          
+            # print("calculate the gradients on the key matrix")
+        elif facet == 'wquery':
+            # gradients on the attn
+            grad = grad @ self._v[0].transpose(-2, -1) # B, num_heads, N, C // num_heads @ B, num_heads, C // num_heads, N -> B, num_heads, N, N
+            # dropout layer scient pass and then softmax layer
+            attn_output = torch.nn.Softmax(dim=-1)(self._attn[0])
+            grad = torch.autograd.grad(attn_output, self._attn[0], grad, retain_graph=True)[0] # chek retain_graph; size B, num_heads, N, N
+            grad = grad*self.setting_dict["scale"]
+
+            print(torch.unique(grad[:,:,1:,1:]), "grad[:,:,1:,1:] for wquery in the previous step")
+
+            # gradients on the query matrix
+            grad = grad @ self._k[0] # B, num_heads, N, N  @ B, num_heads,  N, C // num_heads -> B, num_heads, N, C // num_heads
+            grad = grad.permute(0,2,1,3) # B, N, num_heads, C // num_heads
+            # gradient on the query weight, before summing together on each of patches
+            grad = grad.reshape(self.setting_dict["B"],self.setting_dict["N"], self.setting_dict["C"]) # B, N, C
+
+            print(torch.unique(grad[:,1:,:]), "grad[:,1:,:] for wquery")
+           
+
+            grad_features = torch.zeros(self.setting_dict["B"], self.setting_dict["N"], self.setting_dict["C"], self.setting_dict["C"]).to(self.device)
+            for i in range(self.setting_dict["N"]):
+                # B, C, 1 @ B, 1, C -> B, C, C-> iterate to B, N, C, C 
+                grad_features[:,i,:,:] = self._input[0][:,i, :].unsqueeze(-2).transpose(-2,-1)@grad[:,i,:].unsqueeze(-2)
+            grad_features = grad_features.reshape(self.setting_dict["B"], self.setting_dict["N"], self.setting_dict["C"]* self.setting_dict["C"])
+         
+            
+            print("calculate the gradients on the query matrix")       
+        
+        elif facet in ['wfc1', 'wfc2']:
+            B, N, C = self._input[0].shape
+            C_out = grad.shape[-1]
+            # grad_features = torch.zeros(B, N, C, C_out).to(self.device)
+
+            # for i in range (N):
+            #     grad_features[:,i,:,:] = self._input[0][:,i,:].unsqueeze(-2).transpose(-2,-1)@grad[:,i,:].unsqueeze(-2)
+            # grad_features = grad_features.reshape(B, N, C*C_out)
+            grad_features =  grad
+        else:
+            raise TypeError(f"{facet} is not a supported facet.")
+        self._feats.append(grad_features.detach())                
+
+    def _unregister_hooks(self) -> None:
+        """
+        unregisters the hooks. should be called after feature extraction.
+        """
+        for handle in self.hook_handlers:
+            handle.remove()
+        self.hook_handlers = []
+
 
 
 class FunctionalGradientComputer(AbstractGradientComputer):

@@ -9,7 +9,7 @@ from .projectors import (
     BasicProjector,
     ChunkedCudaProjector,
 )
-from .gradient_computers import FunctionalGradientComputer, AbstractGradientComputer
+from .gradient_computers import FunctionalGradientComputer, AbstractGradientComputer, PatchGradientComputer
 from .score_computers import AbstractScoreComputer, BasicScoreComputer
 from .savers import AbstractSaver, MmapSaver, ModelIDException
 from .utils import get_num_params, get_parameter_chunk_sizes
@@ -22,22 +22,24 @@ from torch import Tensor
 import logging
 import numpy as np
 import torch
-
+import sys
 ch = torch
 
 
 
-class patchTRAker:
+class patchTRAKer:
     def __init__(
         self,
         model: torch.nn.Module,
+        patch_size : int,
+        stride : tuple,
         task: Union[AbstractModelOutput, str],
-        # replace train_set_size: int with train_patch_numbers: int
-        train_patch_numbers: int,
+        train_set_size: int ,
+        centroids: torch.Tensor,
         save_dir: str = "./trak_results",
         load_from_save_dir: bool = True,
         device: Union[str, torch.device] = "cuda",
-        gradient_computer: AbstractGradientComputer = FunctionalGradientComputer,
+        gradient_computer: AbstractGradientComputer = PatchGradientComputer,
         projector: Optional[AbstractProjector] = None,
         saver: Optional[AbstractSaver] = None,
         score_computer: Optional[AbstractScoreComputer] = None,
@@ -47,14 +49,27 @@ class patchTRAker:
         proj_max_batch_size: int = 32,
         projector_seed: int = 0,
         grad_wrt: Optional[Iterable[str]] = None,
+        facet : Optional[Iterable[str]] = None,
+        include_cls: bool = False,
         lambda_reg: float = 0.0,
-    ) -> None:
+        total_num_patches : int = 0    
+        ) -> None:
         
         self.model = model
         self.task = task
+        self.train_set_size = train_set_size
+        self.device = device
+        self.dtype = ch.float16 if use_half_precision else ch.float32
+        self.grad_wrt = grad_wrt
+        self.facet = facet
+        self.lambda_reg = lambda_reg
+        self.total_num_patches = total_num_patches
+        self.include_cls = include_cls
+        print(f"total_num_patches: {total_num_patches}")
+       
 
         logging.basicConfig()
-        self.logger = logging.getLogger("TRAK")
+        self.logger = logging.getLogger("patchTRAK")
         self.logger.setLevel(logging_level)
 
         # set which part of weights gradients should be calcualted
@@ -65,9 +80,26 @@ class patchTRAker:
             self.num_params_for_grad = sum(
                 [d[param_name].numel() for param_name in self.grad_wrt]
             )
+
+            print(self.num_params_for_grad, f"before constranit by {facet}")
+            assert len(self.facet)>=1 and len(self.facet)<=3, "facet should be a list of length 1, 2 or 3"
+            # TODO currently only support attn.qkv.weight
+            self.num_params_for_grad = self.num_params_for_grad // 3 *len(self.facet)
+            print(self.num_params_for_grad, f"when constranit by {facet}")
         else:
             self.num_params_for_grad = self.num_params
 
+
+        # inits self.projector
+        self.proj_seed = projector_seed
+        self.init_projector(
+            projector=projector,
+            proj_dim=proj_dim,
+            proj_max_batch_size=proj_max_batch_size,
+        )
+
+        # normalize to make X^TX numerically stable
+        # doing this instead of normalizing the projector matrix
         self.normalize_factor = ch.sqrt(
             ch.tensor(self.num_params_for_grad, dtype=ch.float32)
         )
@@ -81,14 +113,20 @@ class patchTRAker:
         
         self.gradient_computer = gradient_computer(
             model=self.model,
+            patch_size = patch_size,
+            stride = stride,
             task=self.task,
+            centroids=centroids,
             grad_dim=self.num_params_for_grad,
             dtype=self.dtype,
             device=self.device,
             grad_wrt=self.grad_wrt,
+            facet = self.facet,
+            include_cls=self.include_cls,
         )
 
         # Class to use for computing the final TRAK scores. If None, the class:`.BasicScoreComputer`
+        # TODO we may not need to do any changes for it
         if score_computer is None:
             score_computer = BasicScoreComputer
         self.score_computer = score_computer(
@@ -101,7 +139,7 @@ class patchTRAker:
         metadata = {
             "JL dimension": self.proj_dim,
             "JL matrix type": self.projector.proj_type,
-            "train_patch_numbers": self.train_patch_numbers,
+            "train set size": self.train_set_size,
         }
 
         if saver is None:
@@ -110,6 +148,7 @@ class patchTRAker:
             save_dir=self.save_dir,
             metadata=metadata,
             train_set_size=self.train_set_size,
+            total_num_patches = self.total_num_patches,
             proj_dim=self.proj_dim,
             load_from_save_dir=self.load_from_save_dir,
             logging_level=logging_level,
@@ -246,8 +285,8 @@ class patchTRAker:
     def load_checkpoint(
         self,
         checkpoint: Iterable[Tensor],
-        # model_id: int,
-        # _allow_featurizing_already_registered=False,
+        model_id: int,
+        _allow_featurizing_already_registered=False,
     ) -> None:
         """Loads state dictionary for the given checkpoint; initializes arrays
         to store TRAK features for that checkpoint, tied to the model ID.
@@ -263,18 +302,16 @@ class patchTRAker:
                 Defaults to None.
 
         """
-        # if self.saver.model_ids.get(model_id) is None:
-        #     self.saver.register_model_id(
-        #         model_id, _allow_featurizing_already_registered
-        #     )
-        # else:
-        #     self.saver.load_current_store(model_id)
-
-        # only have one model checkpoint
-        model_id = 0
-        self.saver.load_current_store(model_id)
-
-        self.model.load_state_dict(checkpoint)
+        print(self.saver.model_ids,"self.saver.model_ids in traker.load_checkpoint")
+        if self.saver.model_ids.get(model_id) is None:
+            self.saver.register_model_id(
+                model_id, _allow_featurizing_already_registered
+            )
+        else:
+            self.saver.load_current_store(model_id)
+       
+        # check if the following line is necessary as we already load the checkpoint before initializing the TRAKer
+        # self.model.load_state_dict(checkpoint)
         self.model.eval()
 
 
@@ -294,12 +331,8 @@ class patchTRAker:
 
     def featurize(
         self,
-        image: Tensor,
-        centroid_feat: Tensor,
-        num_patches: int,
-        # batch: Iterable[Tensor],
-        # inds: Optional[Iterable[int]] = None,
-        # num_samples: Optional[int] = None,
+        batch: Iterable[Tensor],
+        num_pacthes_in_batch: Optional[int] = None,
     ) -> None:
         """Creates TRAK features for the given batch by computing the gradient
         of the model output function and projecting it. In the notation of the
@@ -317,57 +350,52 @@ class patchTRAker:
         Args:
             batch (Iterable[Tensor]):
                 input batch
-            inds (Optional[Iterable[int]], optional):
-                Indices of the batch samples in the train set. Defaults to None.
+         
             num_samples (Optional[int], optional):
                 Number of samples in the batch. Defaults to None.
 
         """
-        # we don't need inds or num_samples as we don't chunk the data into several batches and send them into the model
-        # we only have one image
-        # TODO calculate the number of batch in this image
+        torch.cuda.empty_cache()
         assert (
             self.ckpt_loaded == self.saver.current_model_id
         ), "Load a checkpoint using traker.load_checkpoint before featurizing"
        
-        # if num_samples is not None:
-        #     inds = np.arange(self._last_ind, self._last_ind + num_samples)
-        #     self._last_ind += num_samples
-        # else:
-        #     num_samples = inds.reshape(-1).shape[0]
+       
+        inds = np.arange(self._last_ind, self._last_ind + num_pacthes_in_batch)
+        self._last_ind += num_pacthes_in_batch
+       
 
-        assert image.shape[0]==1, "currently only support one image"
-        if centroid_feat.dim() == 1:
-            centrpoid_feat = centroid_feat.unsqueeze(0)
-        assert image.shape[0] == centroid_feat.shape[0], "image and centroid_feat should have the same batch size"
+        # handle re-starting featurizing from a partially featurized model (some inds already featurized)
+        _already_done = (self.saver.current_store["is_featurized"][inds] == 1).reshape(-1)
 
-        inds = np.arange(self._last_ind, self._last_ind + num_patches)
-        self._last_ind += num_patches
+        # TODO set "is_featurized" to be counted by sample number not patch number?
+        inds = inds[~_already_done]
+        if len(inds) == 0:
+            self.logger.debug("All samples in batch already featurized.")
+            return 0
+
         
-        # # handle re-starting featurizing from a partially featurized model (some inds already featurized)
-        # _already_done = (self.saver.current_store["is_featurized"][inds] == 1).reshape(
-        #     -1
-        # )
-        # inds = inds[~_already_done]
-        # if len(inds) == 0:
-        #     self.logger.debug("All samples in batch already featurized.")
-        #     return 0
-
-        grads = self.gradient_computer.compute_per_sample_grad(image=image, centroid_feat=centroid_feat)
+        grads = self.gradient_computer.compute_per_sample_grad(batch = batch)
+       
+      
         grads = self.projector.project(grads, model_id=self.saver.current_model_id)
         grads /= self.normalize_factor
+
         self.saver.current_store["grads"][inds] = (
             grads.to(self.dtype).cpu().clone().detach()
         )
 
-        # Warning: Currently since we set out=loss, loss_grad should be an Identity matrix
-        loss_grads = self.gradient_computer.compute_loss_grad(image=image, centroid_feat=centroid_feat)
-        self.saver.current_store["out_to_loss"][inds] = (
-            loss_grads.to(self.dtype).cpu().clone().detach()
-        )
+        # we don't need "out_to_loss"
+        # loss_grads = self.gradient_computer.compute_loss_grad(batch)
+        # self.saver.current_store["out_to_loss"][inds] = (
+        #     loss_grads.to(self.dtype).cpu().clone().detach()
+        # )
 
         self.saver.current_store["is_featurized"][inds] = 1
-        self.saver.serialize_current_model_id_metadata()
+        self.saver.serialize_current_model_id_metadata() 
+        print(f'finishing one batch with {num_pacthes_in_batch} patches')
+
+        
 
     def finalize_features(
         self, model_ids: Iterable[int] = None, del_grads: bool = False
@@ -385,7 +413,8 @@ class patchTRAker:
                 class. Defaults to None.
 
         """
-
+        # unregister the model hooks
+        self.gradient_computer.finish_grads_computation()
         # this method is memory-intensive, so we're freeing memory beforehand
         torch.cuda.empty_cache()
         self.projector.free_memory()
@@ -412,13 +441,222 @@ class patchTRAker:
 
             self.saver.load_current_store(model_id)
 
-            g = ch.as_tensor(self.saver.current_store["grads"], device=self.device)
+            
+            print("Loading the gradients of trainig patches to cpu")
+            g = ch.as_tensor(self.saver.current_store["grads"], device=torch.device("cpu"))
+            print(g.shape, "g.shape")
             xtx = self.score_computer.get_xtx(g)
+            print(xtx.shape, "xtx.shape")
 
-            features = self.score_computer.get_x_xtx_inv(g, xtx)
-            self.saver.current_store["features"][:] = features.to(self.dtype).cpu()
+            features = self.score_computer.get_x_xtx_inv(g, xtx) # already on cpu
+            # self.saver.current_store["features"][:] = features.to(self.dtype).cpu()
+            self.saver.current_store["features"][:] = features.to(self.dtype)
             if del_grads:
                 self.saver.del_grads(model_id)
 
             self.saver.model_ids[self.saver.current_model_id]["is_finalized"] = 1
             self.saver.serialize_current_model_id_metadata()
+
+    
+    def start_scoring_checkpoint(
+        self,
+        exp_name: str,
+        checkpoint: Iterable[Tensor],
+        model_id: int,
+        num_targets: int,
+    ) -> None:
+        """This method prepares the internal store of the :class:`.TRAKer` class
+        to start computing scores for a set of targets.
+
+        Args:
+            exp_name (str):
+                Here we will set the exp_name = target img name
+                Experiment name. Each experiment should have a unique name, and
+                it corresponds to a set of targets being scored. The experiment
+                name is used as the name for saving the target features, as well
+                as scores produced by this method in the :code:`save_dir` of the
+                :class:`.TRAKer` class.
+            checkpoint (Iterable[Tensor]):
+                model checkpoint (state dict)
+            model_id (int):
+                a unique ID for a checkpoint
+            num_targets (int):
+                number of targets to score
+
+        """
+        print(exp_name, "exp_name", "initialize the experiments")
+        self.saver.init_experiment(exp_name, num_targets, model_id)
+
+        
+        self.model.eval()
+        self.gradient_computer.load_model_params(self.model)
+
+        # TODO: make this exp_name-dependent
+        # e.g. make it a value in self.saver.experiments[exp_name]
+        self._last_ind_target = 0
+
+    def score_one_sample(
+        self,
+        sample: Tensor,
+        label: Tensor,
+        num_patches_in_img: Optional[int] = None,
+    ) -> None:
+        """This method computes the (intermediate per-checkpoint) TRAK scores
+        for a batch of targets and stores them in the internal store of the
+        :class:`.TRAKer` class.
+
+        Either :code:`inds` or :code:`num_samples` must be specified. Using
+        :code:`num_samples` will write sequentially into the internal store of
+        the :class:`.TRAKer`.
+
+        Args:
+            batch (Iterable[Tensor]):
+                input batch
+            inds (Optional[Iterable[int]], optional):
+                Indices of the batch samples in the train set. Defaults to None.
+            num_samples (Optional[int], optional):
+                Number of samples in the batch. Defaults to None.
+
+        """
+       
+        if self.saver.model_ids[self.saver.current_model_id]["is_finalized"] == 0:
+            self.logger.error(
+                f"Model ID {self.saver.current_model_id} not finalized, cannot score"
+            )
+            return None
+
+      
+        inds = np.arange(self._last_ind_target, self._last_ind_target + num_patches_in_img)
+
+        # when calculate the gradient on one target image, initialize the total_num_patches to 0
+        self.gradient_computer.total_num_patches = 0
+        grads = self.gradient_computer.compute_per_patch_grad(sample.to(self.device), label.to(self.device))
+        if grads.shape[0]==1:
+            grads = grads.squeeze(0)
+            
+        # remove cls token
+        grads = self.projector.project(grads[1:,:], model_id=self.saver.current_model_id)# always exclude the CLS token
+        grads /= self.normalize_factor
+        print(f"after projection, the shape of grads is {grads.shape}")
+
+        exp_name = self.saver.current_experiment_name
+        self.saver.current_store[f"{exp_name}_grads"][inds] = (
+            grads.to(self.dtype).cpu().clone().detach()
+        )
+
+
+
+
+    def finalize_scores(
+        self,
+        exp_name: str,
+        model_ids: Iterable[int] = None,
+        allow_skip: bool = False,
+    ) -> Tensor:
+        """This method computes the final TRAK scores for the given targets,
+        train samples, and model checkpoints (specified by model IDs).
+
+        Args:
+            exp_name (str):
+                Experiment name. Each experiment should have a unique name, and
+                it corresponds to a set of targets being scored. The experiment
+                name is used as the name for saving the target features, as well
+                as scores produced by this method in the :code:`save_dir` of the
+                :class:`.TRAKer` class.
+            model_ids (Iterable[int], optional):
+                A list of model IDs for which
+                scores should be finalized. If None, scores are computed
+                for all model IDs in the :code:`save_dir` of the :class:`.TRAKer`
+                class. Defaults to None.
+            allow_skip (bool, optional):
+                If True, raises only a warning, instead of an error, when target
+                gradients are not computed for a given model ID. Defaults to
+                False.
+
+        Returns:
+            Tensor: TRAK scores
+
+        """
+        # reset counter for inds used for scoring
+        self._last_ind_target = 0
+
+        if model_ids is None:
+            model_ids = self.saver.model_ids
+        else:
+            model_ids = {
+                model_id: self.saver.model_ids[model_id] for model_id in model_ids
+            }
+        assert len(model_ids) > 0, "No model IDs to finalize scores for"
+
+        if self.saver.experiments.get(exp_name) is None:
+            raise ValueError(
+                f"Experiment {exp_name} does not exist. Create it\n\
+                              and compute scores first before finalizing."
+            )
+
+        num_targets = self.saver.experiments[exp_name]["num_patch_in_targets"]
+        _completed = [False] * len(model_ids)
+
+        self.saver.load_current_store(list(model_ids.keys())[0], exp_name, num_targets)
+        _scores_mmap = self.saver.current_store[f"{exp_name}_scores"]
+        _scores_on_cpu = ch.zeros(*_scores_mmap.shape, device="cpu")
+        if self.device != "cpu":
+            _scores_on_cpu.pin_memory()
+
+        # we don't need "out_to_loss"
+        # _avg_out_to_losses = np.zeros(
+        #     (self.saver.train_set_size, 1),
+        #     dtype=np.float16 if self.dtype == ch.float16 else np.float32,
+        # )
+
+        for j, model_id in enumerate(
+            tqdm(model_ids, desc="Finalizing scores for all model IDs..")
+        ):
+            self.saver.load_current_store(model_id)
+            try:
+                self.saver.load_current_store(model_id, exp_name, num_targets)
+            except OSError as e:
+                if allow_skip:
+                    self.logger.warning(
+                        f"Could not read target gradients for model ID {model_id}. Skipping."
+                    )
+                    continue
+                else:
+                    raise e
+
+            if self.saver.model_ids[self.saver.current_model_id]["is_finalized"] == 0:
+                self.logger.warning(
+                    f"Model ID {self.saver.current_model_id} not finalized, cannot score"
+                )
+                continue
+
+            # g = ch.as_tensor(self.saver.current_store["features"], device=self.device)
+            g = ch.as_tensor(self.saver.current_store["features"], device=torch.device("cpu"))
+            g_target = ch.as_tensor(
+                self.saver.current_store[f"{exp_name}_grads"], device=g.device
+            )
+            if g.device == torch.device("cpu"):
+                g , g_target = g.to(torch.float32), g_target.to(torch.float32)
+            print(_scores_on_cpu.shape,"_scores_on_cpu.shape")
+            self.score_computer.get_scores(g, g_target, accumulator=_scores_on_cpu)
+            # .cpu().detach().numpy()
+
+            # _avg_out_to_losses += self.saver.current_store["out_to_loss"]
+            _completed[j] = True
+
+        _num_models_used = float(sum(_completed))
+
+        # only write to mmap (on disk) once at the end
+
+        _scores_mmap[:] = (_scores_on_cpu.numpy() / _num_models_used) 
+
+        # _scores_mmap[:] = (_scores_on_cpu.numpy() / _num_models_used) * (
+        #     _avg_out_to_losses / _num_models_used
+        # )
+
+        self.logger.debug(f"Scores dtype is {_scores_mmap.dtype}")
+        self.saver.save_scores(exp_name)
+        self.scores = _scores_mmap
+
+        return self.scores
+

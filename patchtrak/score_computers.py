@@ -149,12 +149,18 @@ class BasicScoreComputer(AbstractScoreComputer):
         )
         blocks = ch.split(grads, split_size_or_sections=self.CUDA_MAX_DIM_SIZE, dim=0)
 
-        for block in blocks:
+        for i, block in enumerate(blocks):
+            # Note that float16 (halfPrecision) is specifically designed for GPU implementation
+            # For CPU implementation, use float32 instead.
             result += block.T.to(self.device) @ block.to(self.device)
+            print(f"block {i} done")
 
         return result
+    
 
+   
     def get_x_xtx_inv(self, grads: Tensor, xtx: Tensor) -> Tensor:
+        local_dtype = ch.float32
         blocks = ch.split(grads, split_size_or_sections=self.CUDA_MAX_DIM_SIZE, dim=0)
 
         xtx_reg = xtx + self.lambda_reg * torch.eye(
@@ -164,16 +170,16 @@ class BasicScoreComputer(AbstractScoreComputer):
 
         # center X^TX inverse a bit to avoid numerical issues when going to float16
         xtx_inv /= xtx_inv.abs().mean()
-
-        xtx_inv = xtx_inv.to(self.dtype)
-
+        
         result = ch.empty(
-            grads.shape[0], xtx_inv.shape[1], dtype=self.dtype, device=self.device
+            grads.shape[0], xtx_inv.shape[1], dtype=local_dtype, device= torch.device("cpu")
         )
         for i, block in enumerate(blocks):
             start = i * self.CUDA_MAX_DIM_SIZE
             end = min(grads.shape[0], (i + 1) * self.CUDA_MAX_DIM_SIZE)
-            result[start:end] = block.to(self.device) @ xtx_inv
+            result[start:end] = block.to(local_dtype) @ xtx_inv.to(torch.device("cpu"))
+
+            print(f"block {i} done in get_x_xtx_inv")
         return result
 
     def get_scores(

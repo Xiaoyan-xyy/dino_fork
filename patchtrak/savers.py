@@ -91,6 +91,9 @@ class AbstractSaver(ABC):
             ), f"In {self.save_dir} there are models using a {existing_matrix_type} JL matrix,\n\
                    and this TRAKer instance uses a {self.metadata['JL matrix type']} JL matrix."
 
+            # TODO remove later
+            print("metadata", self.metadata)
+            print("existsing_metadata", existsing_metadata)
             assert (
                 self.metadata["train set size"] == existsing_metadata["train set size"]
             ), f"In {self.save_dir} there are models TRAKing\n\
@@ -107,7 +110,8 @@ class AbstractSaver(ABC):
         if self.load_from_save_dir:
             # check if there are existing model ids in the save_dir
             self.model_ids_files = self.save_dir.rglob("id_*.json")
-
+            
+            # extract info from all "id_*.json" files and put them into dict self.model_ids
             for existing_model_id_file in self.model_ids_files:
                 with open(existing_model_id_file, "r") as f:
                     existing_id = json.load(f)
@@ -117,6 +121,7 @@ class AbstractSaver(ABC):
                     }
                 self.model_ids.update(existing_id)
 
+            # extract info from experiments.json and put them into dict self.experiments
             if os.path.isfile(self.experiments_file):
                 with open(self.experiments_file, "r") as f:
                     self.experiments.update(json.load(f))
@@ -250,6 +255,7 @@ class MmapSaver(AbstractSaver):
         save_dir,
         metadata,
         train_set_size,
+        total_num_patches,
         proj_dim,
         load_from_save_dir,
         logging_level,
@@ -263,6 +269,7 @@ class MmapSaver(AbstractSaver):
             use_half_precision=use_half_precision,
         )
         self.train_set_size = train_set_size
+        self.total_num_patches = total_num_patches
         self.proj_dim = proj_dim
 
     def register_model_id(
@@ -296,8 +303,9 @@ class MmapSaver(AbstractSaver):
 
     def serialize_current_model_id_metadata(self, already_exists=True) -> None:
         is_featurized = int(
-            self.current_store["is_featurized"].sum() == self.train_set_size
+            self.current_store["is_featurized"].sum() == self.total_num_patches
         )
+        print("serialize_current_model_id_metadata is_featurized", is_featurized)
 
         # update the metadata JSON file
         content = {
@@ -319,10 +327,10 @@ class MmapSaver(AbstractSaver):
         if os.path.exists(prefix):
             self.logger.info(f"Model ID folder {prefix} already exists")
         os.makedirs(prefix, exist_ok=True)
-        featurized_so_far = np.zeros(shape=(self.train_set_size,), dtype=np.int32)
+        featurized_so_far = np.zeros(shape=(self.total_num_patches,), dtype=np.int32)
         ft = self._load(
             prefix.joinpath("_is_featurized.mmap"),
-            shape=(self.train_set_size,),
+            shape=(self.total_num_patches,),
             mode="w+",
             dtype=np.int32,
         )
@@ -331,7 +339,7 @@ class MmapSaver(AbstractSaver):
 
         self.load_current_store(model_id, mode="w+")
 
-    def init_experiment(self, exp_name, num_targets, model_id) -> None:
+    def init_experiment(self, exp_name, num_patch_in_targets, model_id) -> None:
         prefix = self.save_dir.joinpath(str(model_id))
         if not os.path.exists(prefix):
             raise ModelIDException(
@@ -339,7 +347,7 @@ class MmapSaver(AbstractSaver):
             cannot start scoring"
             )
         self.experiments[exp_name] = {
-            "num_targets": num_targets,
+            "num_patch_in_targets": num_patch_in_targets,
             "scores_path": str(self.save_dir.joinpath(f"scores/{exp_name}.mmap")),
             "scores_finalized": 0,
         }
@@ -357,7 +365,7 @@ class MmapSaver(AbstractSaver):
         else:
             mode = "w+"
         self.load_current_store(
-            model_id=model_id, exp_name=exp_name, exp_num_targets=num_targets, mode=mode
+            model_id=model_id, exp_name=exp_name, exp_num_targets=num_patch_in_targets, mode=mode
         )
 
     def _load(self, fname, shape, mode, dtype=None):
@@ -402,25 +410,48 @@ class MmapSaver(AbstractSaver):
         prefix = self.save_dir.joinpath(str(self.current_model_id))
 
         if exp_name is None:
+            # to_load = {
+            #     "grads": (
+            #         prefix.joinpath("grads.mmap"),
+            #         (self.train_set_size, self.proj_dim),
+            #         None,
+            #     ),
+            #     "out_to_loss": (
+            #         prefix.joinpath("out_to_loss.mmap"),
+            #         (self.train_set_size, 1),
+            #         None,
+            #     ),
+            #     "features": (
+            #         prefix.joinpath("features.mmap"),
+            #         (self.train_set_size, self.proj_dim),
+            #         None,
+            #     ),
+            #     "is_featurized": (
+            #         prefix.joinpath("_is_featurized.mmap"),
+            #         (self.train_set_size, 1),
+            #         np.int32,
+            #     ),
+            # }
+
             to_load = {
                 "grads": (
                     prefix.joinpath("grads.mmap"),
-                    (self.train_set_size, self.proj_dim),
+                    (self.total_num_patches, self.proj_dim),
                     None,
                 ),
                 "out_to_loss": (
                     prefix.joinpath("out_to_loss.mmap"),
-                    (self.train_set_size, 1),
+                    (self.total_num_patches, 1),
                     None,
                 ),
                 "features": (
                     prefix.joinpath("features.mmap"),
-                    (self.train_set_size, self.proj_dim),
+                    (self.total_num_patches, self.proj_dim),
                     None,
                 ),
                 "is_featurized": (
                     prefix.joinpath("_is_featurized.mmap"),
-                    (self.train_set_size, 1),
+                    (self.total_num_patches, 1),
                     np.int32,
                 ),
             }
@@ -433,7 +464,7 @@ class MmapSaver(AbstractSaver):
                 ),
                 f"{exp_name}_scores": (
                     self.save_dir.joinpath(f"scores/{exp_name}.mmap"),
-                    (self.train_set_size, exp_num_targets),
+                    (self.total_num_patches, exp_num_targets),
                     None,
                 ),
             }
